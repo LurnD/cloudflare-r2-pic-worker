@@ -1,7 +1,140 @@
+// 认证配置
+const AUTH_CONFIG = {
+  username: "admin", // 修改为您想要的用户名
+  password: "your-strong-password-here", // 修改为您的强密码
+  enabled: true // 设置为false可临时禁用认证
+};
+
+// 速率限制配置
+const RATE_LIMIT = {
+  enabled: true,
+  window: 60 * 1000, // 1分钟窗口期
+  max: {
+    upload: 5,  // 每分钟最多上传5张图片
+    delete: 10, // 每分钟最多删除10张图片
+    browse: 30  // 每分钟最多浏览30次目录
+  }
+};
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname.slice(1); // 去掉开头的斜杠
+    
+    // 检查是否为图片直接访问请求
+    const isDirectImageRequest = path && path !== 'manage' && path !== 'browser' && 
+                               !path.startsWith('api/') && !path.startsWith('delete/') && 
+                               !path.endsWith('.html') && path !== '';
+    
+    // 允许直接访问图片无需认证
+    if (!isDirectImageRequest) {
+      // 如果启用了认证，检查是否已登录(除了登录页面和登录API)
+      if (AUTH_CONFIG.enabled && 
+          path !== '' && // 允许访问首页
+          path !== 'login' && 
+          path !== 'login.html' && 
+          path !== 'api/auth') {
+        
+        // 检查Cookie中的认证状态
+        const authCookie = getCookie(request.headers.get('Cookie'), 'r2auth');
+        if (!authCookie || authCookie !== generateAuthToken(AUTH_CONFIG.username, AUTH_CONFIG.password)) {
+          // 重定向到登录页面
+          return Response.redirect(`${url.origin}/login`, 302);
+        }
+      }
+    }
+    
+    // 处理登录请求
+    if (request.method === 'POST' && path === 'api/auth') {
+      return handleAuth(request, url.origin);
+    }
+    
+    // 登录页面
+    if (path === 'login' || path === 'login.html') {
+      return serveLoginPage(url.origin);
+    }
+    
+    // 登出功能
+    if (path === 'logout') {
+      return new Response('Logged out', {
+        status: 302,
+        headers: {
+          'Location': `${url.origin}/login`,
+          'Set-Cookie': 'r2auth=deleted; HttpOnly; Path=/; Max-Age=0'
+        }
+      });
+    }
+    
+    // API请求速率限制
+    if (RATE_LIMIT.enabled) {
+      // 上传限制
+      if (request.method === 'POST' && path === 'upload') {
+        const limited = await checkRateLimit(request, env, 'upload');
+        if (limited) {
+          return new Response(JSON.stringify({
+            success: false,
+            message: '请求过于频繁，请稍后再试'
+          }), {
+            status: 429,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+      }
+      
+      // 删除限制
+      if (request.method === 'DELETE' && path.startsWith('delete/')) {
+        const limited = await checkRateLimit(request, env, 'delete');
+        if (limited) {
+          return new Response(JSON.stringify({
+            success: false,
+            message: '请求过于频繁，请稍后再试'
+          }), {
+            status: 429,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+      }
+      
+      // 浏览目录限制
+      if (request.method === 'GET' && path.startsWith('api/browse/')) {
+        const limited = await checkRateLimit(request, env, 'browse');
+        if (limited) {
+          return new Response(JSON.stringify({
+            error: '请求过于频繁，请稍后再试'
+          }), {
+            status: 429,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+      }
+    }
+    
+    // 处理图片请求 - 支持路径嵌套的版本
+    if (request.method === 'GET' && isDirectImageRequest) {
+      try {
+        console.log("尝试获取图片:", path);
+        const object = await env.MY_BUCKET.get(path);
+        
+        if (!object) {
+          console.log("图片不存在:", path);
+          return new Response('图片不存在', { status: 404 });
+        }
+        
+        const headers = new Headers();
+        object.writeHttpMetadata(headers);
+        headers.set('etag', object.httpEtag);
+        headers.set('Cache-Control', 'public, max-age=31536000'); // 缓存一年
+        // 添加CORS头
+        headers.set('Access-Control-Allow-Origin', '*');
+        
+        return new Response(object.body, {
+          headers
+        });
+      } catch (err) {
+        console.error("获取图片错误:", err);
+        return new Response('获取图片失败: ' + err.message, { status: 500 });
+      }
+    }
     
     // 处理上传请求
     if (request.method === 'POST') {
@@ -58,35 +191,6 @@ export default {
           console.error("上传错误:", err);
           return new Response('上传失败: ' + err.message, { status: 500 });
         }
-      }
-    }
-    
-    // 处理获取图片请求 - 支持路径嵌套的版本
-    if (request.method === 'GET' && path && path !== 'manage' && path !== 'browser' && 
-        !path.startsWith('api/') && !path.startsWith('delete/') && 
-        !path.endsWith('.html') && path !== '') {
-      try {
-        console.log("尝试获取图片:", path);
-        const object = await env.MY_BUCKET.get(path);
-        
-        if (!object) {
-          console.log("图片不存在:", path);
-          return new Response('图片不存在', { status: 404 });
-        }
-        
-        const headers = new Headers();
-        object.writeHttpMetadata(headers);
-        headers.set('etag', object.httpEtag);
-        headers.set('Cache-Control', 'public, max-age=31536000'); // 缓存一年
-        // 添加CORS头
-        headers.set('Access-Control-Allow-Origin', '*');
-        
-        return new Response(object.body, {
-          headers
-        });
-      } catch (err) {
-        console.error("获取图片错误:", err);
-        return new Response('获取图片失败: ' + err.message, { status: 500 });
       }
     }
     
@@ -216,6 +320,15 @@ export default {
                   margin-left: 15px;
                   text-decoration: none;
                   color: #4a89dc;
+                }
+                .user-section {
+                  display: flex;
+                  align-items: center;
+                }
+                .username {
+                  margin-right: 15px;
+                  font-size: 14px;
+                  color: #666;
                 }
                 .upload-section {
                   margin-bottom: 30px;
@@ -409,6 +522,15 @@ export default {
                   color: #666;
                   margin-bottom: 20px;
                 }
+                .rate-limit-warning {
+                  display: none;
+                  color: #d9534f;
+                  margin-bottom: 10px;
+                  padding: 8px;
+                  background: #f9f2f4;
+                  border-radius: 4px;
+                  font-size: 14px;
+                }
                 @media (max-width: 768px) {
                   .directory-list, .file-grid {
                     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
@@ -426,13 +548,20 @@ export default {
             <body>
               <header>
                 <h1>R2图床管理</h1>
-                <div class="nav-links">
-                  <a href="/">首页</a>
+                <div class="user-section">
+                  <span class="username">当前用户: ${AUTH_CONFIG.username}</span>
+                  <div class="nav-links">
+                    <a href="/">首页</a>
+                    <a href="/logout">退出登录</a>
+                  </div>
                 </div>
               </header>
               
               <div class="upload-section">
                 <h2>上传新图片</h2>
+                <div id="rateLimitWarning" class="rate-limit-warning">
+                  注意: 上传限制为每分钟${RATE_LIMIT.max.upload}张图片
+                </div>
                 <form id="uploadForm">
                   <div>
                     <input type="file" name="image" id="fileInput" accept="image/*" required>
@@ -479,6 +608,16 @@ export default {
                   
                   try {
                     const response = await fetch(\`/api/browse/\${path}\`);
+                    if (response.status === 429) {
+                      browserContent.innerHTML = \`
+                        <div class="empty-message" style="color: #d9534f;">
+                          <p>请求过于频繁，请稍后再试</p>
+                          <p><button class="btn btn-primary" onclick="setTimeout(() => loadDirectory('${path}'), 3000)">3秒后重试</button></p>
+                        </div>
+                      \`;
+                      return;
+                    }
+                    
                     if (!response.ok) {
                       throw new Error('加载失败: ' + response.status);
                     }
@@ -635,6 +774,7 @@ export default {
                   }
                   
                   const result = document.getElementById('uploadResult');
+                  const rateLimitWarning = document.getElementById('rateLimitWarning');
                   result.innerHTML = '<p>上传中...</p>';
                   
                   try {
@@ -642,6 +782,12 @@ export default {
                       method: 'POST',
                       body: formData
                     });
+                    
+                    if (response.status === 429) {
+                      result.innerHTML = '<p style="color: red;">上传频率过高，请稍后再试</p>';
+                      rateLimitWarning.style.display = 'block';
+                      return;
+                    }
                     
                     const data = await response.json();
                     if (data.success) {
@@ -698,6 +844,11 @@ export default {
                     const response = await fetch(\`/delete/\${encodeURIComponent(fileName)}\`, {
                       method: 'DELETE'
                     });
+                    
+                    if (response.status === 429) {
+                      alert('删除操作过于频繁，请稍后再试');
+                      return;
+                    }
                     
                     const data = await response.json();
                     if (data.success) {
@@ -852,29 +1003,40 @@ export default {
               textarea { width: 100%; font-family: monospace; }
               .copy-btn { background: #4a89dc; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; margin-top: 5px; }
               .custom-path-section { margin-top: 10px; padding: 10px; background: #f1f1f1; border-radius: 4px; display: none; }
+              .login-alert { margin-bottom: 20px; padding: 10px; background: #f5f5f5; border-radius: 4px; }
+              .rate-limit-warning { color: #d9534f; margin-bottom: 10px; font-size: 0.9em; }
             </style>
           </head>
           <body>
             <div class="container">
               <h1>R2图床上传</h1>
-              <form id="uploadForm">
-                <input type="file" name="image" id="fileInput" accept="image/*" required>
-                
-                <div>
-                  <input type="checkbox" id="useCustomPath" name="useCustomPath" value="true">
-                  <label for="useCustomPath">使用自定义路径</label>
+              
+              ${AUTH_CONFIG.enabled && !getCookie(request.headers.get('Cookie'), 'r2auth') ? `
+                <div class="login-alert">
+                  <p>您需要登录才能上传和管理图片。</p>
+                  <a href="/login" class="manage-link">登录 →</a>
                 </div>
-                
-                <div id="customPathSection" class="custom-path-section">
-                  <label for="customPath">自定义路径:</label>
-                  <input type="text" id="customPath" name="customPath" placeholder="例如: US/Cards/Visa" style="width: 100%;">
-                  <div><small>注意：无需添加开头和结尾的斜杠</small></div>
-                </div>
-                
-                <button type="submit">上传图片</button>
-              </form>
-              <div id="result"></div>
-              <a href="/manage" class="manage-link">管理已上传的图片 →</a>
+              ` : `
+                <form id="uploadForm">
+                  <div class="rate-limit-warning">注意: 上传限制为每分钟${RATE_LIMIT.max.upload}张图片</div>
+                  <input type="file" name="image" id="fileInput" accept="image/*" required>
+                  
+                  <div>
+                    <input type="checkbox" id="useCustomPath" name="useCustomPath" value="true">
+                    <label for="useCustomPath">使用自定义路径</label>
+                  </div>
+                  
+                  <div id="customPathSection" class="custom-path-section">
+                    <label for="customPath">自定义路径:</label>
+                    <input type="text" id="customPath" name="customPath" placeholder="例如: US/Cards/Visa" style="width: 100%;">
+                    <div><small>注意：无需添加开头和结尾的斜杠</small></div>
+                  </div>
+                  
+                  <button type="submit">上传图片</button>
+                </form>
+                <div id="result"></div>
+                <a href="/manage" class="manage-link">管理已上传的图片 →</a>
+              `}
               
               <div class="features">
                 <h3>功能介绍</h3>
@@ -884,51 +1046,69 @@ export default {
                   <li>自动生成唯一文件名</li>
                   <li>提供URL和Markdown格式代码</li>
                   <li>管理页面按目录分级展示图片</li>
+                  <li>安全身份验证和请求频率限制</li>
                 </ul>
               </div>
             </div>
             
             <script>
               // 自定义路径复选框事件
-              document.getElementById('useCustomPath').addEventListener('change', function() {
-                const customPathSection = document.getElementById('customPathSection');
-                customPathSection.style.display = this.checked ? 'block' : 'none';
-              });
+              const useCustomPath = document.getElementById('useCustomPath');
+              if (useCustomPath) {
+                useCustomPath.addEventListener('change', function() {
+                  const customPathSection = document.getElementById('customPathSection');
+                  customPathSection.style.display = this.checked ? 'block' : 'none';
+                });
+              }
               
-              document.getElementById('uploadForm').addEventListener('submit', async (e) => {
-                e.preventDefault();
-                const formData = new FormData(e.target);
-                const result = document.getElementById('result');
-                result.innerHTML = '<p>上传中...</p>';
-                
-                try {
-                  const response = await fetch('/upload', {
-                    method: 'POST',
-                    body: formData
-                  });
+              // 上传表单
+              const uploadForm = document.getElementById('uploadForm');
+              if (uploadForm) {
+                uploadForm.addEventListener('submit', async (e) => {
+                  e.preventDefault();
+                  const formData = new FormData(e.target);
+                  const result = document.getElementById('result');
+                  result.innerHTML = '<p>上传中...</p>';
                   
-                  const data = await response.json();
-                  if (data.success) {
-                    // 提取纯文件名（不含路径）
-                    const fileName = data.fileName.split('/').pop();
+                  try {
+                    const response = await fetch('/upload', {
+                      method: 'POST',
+                      body: formData
+                    });
                     
-                    result.innerHTML = \`
-                      <p style="color: green;">上传成功!</p>
-                      <p>图片链接: <a href="\${data.url}" target="_blank">\${data.url}</a></p>
-                      <div>
-                        <p>Markdown代码:</p>
-                        <textarea rows="2" onclick="this.select()">![\${fileName}](\${data.url})</textarea>
-                        <button class="copy-btn" onclick="copyToClipboard('![\${fileName}](\${data.url})')">复制Markdown代码</button>
-                      </div>
-                      <img src="\${data.url}" style="max-width: 100%; margin-top: 15px;" />
-                    \`;
-                  } else {
-                    result.innerHTML = '<p style="color: red;">上传失败: ' + data.message + '</p>';
+                    if (response.status === 429) {
+                      result.innerHTML = '<p style="color: red;">上传频率过高，请稍后再试</p>';
+                      return;
+                    }
+                    
+                    if (response.status === 302 || response.status === 401) {
+                      window.location.href = '/login';
+                      return;
+                    }
+                    
+                    const data = await response.json();
+                    if (data.success) {
+                      // 提取纯文件名（不含路径）
+                      const fileName = data.fileName.split('/').pop();
+                      
+                      result.innerHTML = \`
+                        <p style="color: green;">上传成功!</p>
+                        <p>图片链接: <a href="\${data.url}" target="_blank">\${data.url}</a></p>
+                        <div>
+                          <p>Markdown代码:</p>
+                          <textarea rows="2" onclick="this.select()">![\${fileName}](\${data.url})</textarea>
+                          <button class="copy-btn" onclick="copyToClipboard('![\${fileName}](\${data.url})')">复制Markdown代码</button>
+                        </div>
+                        <img src="\${data.url}" style="max-width: 100%; margin-top: 15px;" />
+                      \`;
+                    } else {
+                      result.innerHTML = '<p style="color: red;">上传失败: ' + data.message + '</p>';
+                    }
+                  } catch (err) {
+                    result.innerHTML = '<p style="color: red;">上传出错: ' + err.message + '</p>';
                   }
-                } catch (err) {
-                  result.innerHTML = '<p style="color: red;">上传出错: ' + err.message + '</p>';
-                }
-              });
+                });
+              }
               
               function copyToClipboard(text) {
                 navigator.clipboard.writeText(text).then(() => {
@@ -953,6 +1133,11 @@ export default {
           'Content-Type': 'text/html'
         }
       });
+    }
+    
+    // 登录页面
+    if (path === 'login' || path === 'login.html') {
+      return serveLoginPage(url.origin);
     }
     
     // 404页面 - Catch-all
@@ -986,3 +1171,148 @@ export default {
     });
   }
 };
+
+// 获取Cookie值
+function getCookie(cookieString, name) {
+  if (!cookieString) return null;
+  const cookies = cookieString.split(';');
+  for (const cookie of cookies) {
+    const [cookieName, cookieValue] = cookie.trim().split('=');
+    if (cookieName === name) {
+      return cookieValue;
+    }
+  }
+  return null;
+}
+
+// 生成认证令牌
+function generateAuthToken(username, password) {
+  // 简单实现，生产环境建议使用更安全的方法
+  return btoa(`${username}:${password}`);
+}
+
+// 处理登录认证
+async function handleAuth(request, origin) {
+  try {
+    const formData = await request.formData();
+    const username = formData.get('username');
+    const password = formData.get('password');
+    
+    if (username === AUTH_CONFIG.username && password === AUTH_CONFIG.password) {
+      const authToken = generateAuthToken(username, password);
+      
+      // 设置Cookie并重定向到管理页面
+      return new Response('Login successful', {
+        status: 302,
+        headers: {
+          'Location': `${origin}/manage`,
+          'Set-Cookie': `r2auth=${authToken}; HttpOnly; Path=/; Max-Age=86400` // 24小时有效
+        }
+      });
+    } else {
+      // 登录失败
+      return Response.redirect(`${origin}/login?error=1`, 302);
+    }
+  } catch (err) {
+    return new Response('Authentication error', { status: 500 });
+  }
+}
+
+// 提供登录页面
+function serveLoginPage(origin) {
+  return new Response(`
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>登录 - R2图床</title>
+        <style>
+          body { font-family: system-ui, sans-serif; max-width: 400px; margin: 0 auto; padding: 20px; }
+          .container { background: #f9f9f9; border-radius: 8px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-top: 50px; }
+          h1 { margin-top: 0; color: #333; text-align: center; }
+          form { display: flex; flex-direction: column; gap: 15px; }
+          label { font-weight: bold; }
+          input[type="text"], input[type="password"] { padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
+          button { background: #4a89dc; color: white; border: none; padding: 12px; border-radius: 4px; cursor: pointer; font-size: 16px; }
+          button:hover { background: #3a70c0; }
+          .error { color: #d9534f; margin-bottom: 15px; text-align: center; }
+          .back-link { text-align: center; margin-top: 20px; }
+          .back-link a { color: #666; text-decoration: none; font-size: 14px; }
+          .back-link a:hover { text-decoration: underline; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>R2图床登录</h1>
+          <div id="error-message" class="error" style="display: none;">用户名或密码不正确</div>
+          <form id="loginForm" action="/api/auth" method="post">
+            <div>
+              <label for="username">用户名:</label>
+              <input type="text" id="username" name="username" required>
+            </div>
+            <div>
+              <label for="password">密码:</label>
+              <input type="password" id="password" name="password" required>
+            </div>
+            <button type="submit">登录</button>
+          </form>
+          <div class="back-link">
+            <a href="/">← 返回首页</a>
+          </div>
+        </div>
+        
+        <script>
+          // 检查URL参数，显示错误信息
+          const urlParams = new URLSearchParams(window.location.search);
+          if (urlParams.get('error') === '1') {
+            document.getElementById('error-message').style.display = 'block';
+          }
+        </script>
+      </body>
+    </html>
+  `, {
+    headers: { 'Content-Type': 'text/html' }
+  });
+}
+
+// 检查API请求频率限制
+async function checkRateLimit(request, env, action) {
+  const clientIP = request.headers.get('CF-Connecting-IP') || '127.0.0.1';
+  const key = `rate_limit:${action}:${clientIP}`;
+  const now = Date.now();
+  const windowStart = now - RATE_LIMIT.window;
+  
+  // 使用R2存储桶自身作为简单的计数器存储
+  // 注意：生产环境建议使用KV或Durable Objects
+  try {
+    const record = await env.MY_BUCKET.get(`${key}.json`);
+    let timestamps = [];
+    
+    if (record) {
+      timestamps = JSON.parse(await record.text());
+      // 只保留窗口期内的时间戳
+      timestamps = timestamps.filter(time => time > windowStart);
+    }
+    
+    // 如果请求次数超过限制
+    if (timestamps.length >= RATE_LIMIT.max[action]) {
+      console.log(`Rate limit exceeded for ${action} by ${clientIP}, count: ${timestamps.length}`);
+      return true;
+    }
+    
+    // 添加新的时间戳
+    timestamps.push(now);
+    
+    // 更新记录
+    await env.MY_BUCKET.put(`${key}.json`, JSON.stringify(timestamps), {
+      httpMetadata: { contentType: 'application/json' }
+    });
+    
+    return false;
+  } catch (err) {
+    console.error("Rate limit check error:", err);
+    // 出错时允许请求通过，以防止阻止合法请求
+    return false;
+  }
+}
